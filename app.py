@@ -8,7 +8,7 @@ import urllib.request
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -60,6 +60,45 @@ COOKIE_URL = os.getenv(
 COOKIES_FILE = "cookies.txt"
 
 DB_FILE = "cache.db"
+
+# =========================================================
+# API KEY AUTHENTICATION
+# =========================================================
+# Set API_KEY in Heroku Config Vars. Keep this value secret.
+# Client requests should send: X-API-Key: <your-key>
+# Authorization: Bearer <your-key> is also accepted.
+
+API_KEY = os.getenv("API_KEY", "").strip()
+
+
+async def require_api_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None)
+):
+    """Protect API endpoints with a server-side API key."""
+
+    if not API_KEY:
+        logger.error("API_KEY is not configured on the server.")
+        raise HTTPException(
+            status_code=503,
+            detail="API authentication is not configured on the server."
+        )
+
+    supplied_key = (x_api_key or "").strip()
+
+    # Also accept Authorization: Bearer <key> for clients that prefer it.
+    if not supplied_key and authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            supplied_key = token.strip()
+
+    if not supplied_key or supplied_key != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key."
+        )
+
+    return True
 
 
 # =========================================================
@@ -567,7 +606,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="YouTube Downloader & Search API",
-    version="2.2.0-Production",
+    version="2.3.0-Production",
     lifespan=lifespan
 )
 
@@ -1538,7 +1577,7 @@ async def health_check():
             "healthy",
 
         "version":
-            "2.2.0",
+            "2.3.0",
 
         "yt_dlp_version":
             yt_dlp.version.__version__,
@@ -1554,6 +1593,8 @@ async def health_check():
 
 @app.get("/search")
 async def search_youtube_music(
+
+    _: bool = Depends(require_api_key),
 
     q: str = Query(
         ...,
@@ -1687,6 +1728,8 @@ async def search_youtube_music(
 @app.get("/thumbnail")
 async def get_thumbnail(
 
+    _: bool = Depends(require_api_key),
+
     url: str = Query(
         ...,
         description="YouTube URL"
@@ -1727,6 +1770,8 @@ async def get_thumbnail(
 
 @app.get("/download")
 async def download_audio(
+
+    _: bool = Depends(require_api_key),
 
     url: str = Query(
         ...,
@@ -1771,6 +1816,8 @@ async def download_audio(
 @app.get("/video")
 async def download_video(
 
+    _: bool = Depends(require_api_key),
+
     url: str = Query(
         ...,
         description="YouTube URL"
@@ -1813,7 +1860,8 @@ async def download_video(
 
 @app.get("/files/{filename}")
 async def get_file(
-    filename: str
+    filename: str,
+    _: bool = Depends(require_api_key)
 ):
 
     filename = os.path.basename(
