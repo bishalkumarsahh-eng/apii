@@ -67,13 +67,15 @@ DB_FILE = "cache.db"
 # Set API_KEY in Heroku Config Vars. Keep this value secret.
 # Client requests should send: X-API-Key: <your-key>
 # Authorization: Bearer <your-key> is also accepted.
+# For compatibility, ?api_key=<your-key> is also accepted.
 
 API_KEY = os.getenv("API_KEY", "").strip()
 
 
 async def require_api_key(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(default=None)
+    authorization: Optional[str] = Header(default=None),
+    api_key: Optional[str] = Query(default=None, description="API key (legacy/query compatibility)")
 ):
     """Protect API endpoints with a server-side API key."""
 
@@ -84,7 +86,9 @@ async def require_api_key(
             detail="API authentication is not configured on the server."
         )
 
-    supplied_key = (x_api_key or "").strip()
+    # Prefer the HTTP header. Also accept ?api_key=... for compatibility
+    # with existing Music Bot clients.
+    supplied_key = (x_api_key or api_key or "").strip()
 
     # Also accept Authorization: Bearer <key> for clients that prefer it.
     if not supplied_key and authorization:
