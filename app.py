@@ -52,10 +52,7 @@ PORT = int(
     )
 )
 
-COOKIE_URL = os.getenv(
-    "COOKIE_URL",
-    ""
-)
+COOKIE_URL = os.getenv("COOKIE_URL", "")
 
 # YouTube player clients. Avoid the deprecated/problematic tv_downgraded
 # client that can cause "The page needs to be reloaded" errors.
