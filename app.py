@@ -58,8 +58,16 @@ COOKIE_URL = os.getenv("COOKIE_URL", "")
 # client that can cause "The page needs to be reloaded" errors.
 YOUTUBE_PLAYER_CLIENTS = os.getenv(
     "YOUTUBE_PLAYER_CLIENTS",
-    "default,web_embedded"
+    "web_embedded"
 ).strip()
+
+# YouTube can currently downgrade logged-in cookie sessions to the
+# tv_downgraded client, which may return "The page needs to be reloaded".
+# Public music/video downloads normally do not need account cookies.
+YOUTUBE_USE_COOKIES = os.getenv(
+    "YOUTUBE_USE_COOKIES",
+    "false"
+).strip().lower() in ("1", "true", "yes", "on")
 
 COOKIES_FILE = "cookies.txt"
 
@@ -781,7 +789,7 @@ def get_base_ydl_opts() -> Dict[str, Any]:
             ]
     }
 
-    if os.path.exists(
+    if YOUTUBE_USE_COOKIES and os.path.exists(
         COOKIES_FILE
     ):
 
@@ -792,6 +800,11 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         logger.info(
             f"Loaded cookies from "
             f"{COOKIES_FILE}"
+        )
+    elif os.path.exists(COOKIES_FILE):
+        logger.info(
+            "cookies.txt found but disabled for YouTube downloads "
+            "(YOUTUBE_USE_COOKIES=false)"
         )
 
     return opts
