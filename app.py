@@ -3,6 +3,7 @@ import re
 import time
 import asyncio
 import sqlite3
+import threading
 import logging
 import urllib.request
 from contextlib import asynccontextmanager
@@ -184,21 +185,40 @@ logger = logging.getLogger(__name__)
 # repeated play request can skip the yt-dlp extraction step.
 DIRECT_URL_CACHE: Dict[str, tuple] = {}
 DIRECT_URL_CACHE_TTL = int(os.getenv("DIRECT_URL_CACHE_TTL", "900"))
+DIRECT_URL_CACHE_MAX = int(os.getenv("DIRECT_URL_CACHE_MAX", "2048"))
+DIRECT_CACHE_LOCK = threading.Lock()
+DIRECT_RESOLVE_LOCKS: Dict[str, threading.Lock] = {}
+DIRECT_RESOLVE_LOCKS_GUARD = threading.Lock()
 
 
 def _get_direct_cached(video_id: str):
-    item = DIRECT_URL_CACHE.get(video_id)
-    if not item:
-        return None
-    url, created = item
-    if time.time() - created >= DIRECT_URL_CACHE_TTL:
-        DIRECT_URL_CACHE.pop(video_id, None)
-        return None
-    return url
+    with DIRECT_CACHE_LOCK:
+        item = DIRECT_URL_CACHE.get(video_id)
+        if not item:
+            return None
+        url, created = item
+        if time.time() - created >= DIRECT_URL_CACHE_TTL:
+            DIRECT_URL_CACHE.pop(video_id, None)
+            return None
+        return url
 
 
 def _set_direct_cached(video_id: str, media_url: str):
-    DIRECT_URL_CACHE[video_id] = (media_url, time.time())
+    with DIRECT_CACHE_LOCK:
+        if len(DIRECT_URL_CACHE) >= DIRECT_URL_CACHE_MAX and video_id not in DIRECT_URL_CACHE:
+            oldest_id = min(DIRECT_URL_CACHE, key=lambda key: DIRECT_URL_CACHE[key][1])
+            DIRECT_URL_CACHE.pop(oldest_id, None)
+        DIRECT_URL_CACHE[video_id] = (media_url, time.time())
+
+
+def _get_direct_resolve_lock(video_id: str) -> threading.Lock:
+    # Coalesce simultaneous requests for the same song without serializing different songs.
+    with DIRECT_RESOLVE_LOCKS_GUARD:
+        lock = DIRECT_RESOLVE_LOCKS.get(video_id)
+        if lock is None:
+            lock = threading.Lock()
+            DIRECT_RESOLVE_LOCKS[video_id] = lock
+        return lock
 
 
 # =========================================================
@@ -723,6 +743,27 @@ except Exception as e:
 
 ytmusic = YTMusic()
 
+SEARCH_CACHE: Dict[str, tuple] = {}
+SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "120"))
+SEARCH_CACHE_MAX = int(os.getenv("SEARCH_CACHE_MAX", "512"))
+
+
+def _get_search_cached(key: str):
+    item = SEARCH_CACHE.get(key)
+    if not item:
+        return None
+    value, created = item
+    if time.time() - created >= SEARCH_CACHE_TTL:
+        SEARCH_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _set_search_cached(key: str, value):
+    if len(SEARCH_CACHE) >= SEARCH_CACHE_MAX and key not in SEARCH_CACHE:
+        SEARCH_CACHE.pop(next(iter(SEARCH_CACHE)), None)
+    SEARCH_CACHE[key] = (value, time.time())
+
 
 # =========================================================
 # VIDEO ID EXTRACTION
@@ -812,10 +853,7 @@ def get_base_ydl_opts() -> Dict[str, Any]:
                 "node": {}
             },
 
-        "remote_components":
-            [
-                "ejs:github"
-            ]
+        # yt-dlp-ejs is installed locally; avoid a GitHub fetch on every download.
     }
 
     if YOUTUBE_USE_COOKIES and os.path.exists(
@@ -889,29 +927,11 @@ def fetch_thumbnail_sync(
 # ULTRA-FAST DIRECT AUDIO RESOLVER
 # =========================================================
 
-def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
-    """Low-latency direct YouTube audio resolver.
-
-    Fast path is deliberately small: use the authenticated/default player client
-    when cookies are available, because this avoids wasting time on several
-    sequential clients that are likely to be bot-blocked on Heroku.  Fall back
-    to public clients only when no cookies are configured.
-    """
-    video_id = extract_video_id(url)
-    if not video_id:
-        raise RuntimeError("Invalid YouTube URL or video ID")
-
-    cached = _get_direct_cached(video_id)
-    if cached:
-        return {"status": True, "videoId": video_id, "url": cached,
-                "cached": True, "resolve_time": 0}
-
+def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
     canonical = f"https://www.youtube.com/watch?v={video_id}"
     use_cookies = YOUTUBE_USE_COOKIES and os.path.isfile(COOKIES_FILE)
     started = time.perf_counter()
 
-    # IMPORTANT: don't request a narrow m4a format. Some player clients expose
-    # only WebM/Opus, which caused "Requested format is not available".
     common = {
         "quiet": True,
         "no_warnings": True,
@@ -928,22 +948,14 @@ def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
         },
     }
 
-    # One primary attempt. Sequentially trying android -> web -> embedded was
-    # causing 10-20 second failures before the API finally returned 500.
-    if use_cookies:
-        attempts = [("default", True)]
-    else:
-        attempts = [("android", False), ("web", False)]
-
+    # Try one fast path first. Only fall back when the first client actually fails.
+    attempts = [("default", True)] if use_cookies else [("android", False), ("web", False)]
     last_error = None
     for name, with_cookies in attempts:
         opts = dict(common)
         opts["extractor_args"] = {"youtube": [f"player_client={name}"]}
-
         if with_cookies:
             opts["cookiefile"] = COOKIES_FILE
-            # Node is already declared by the Heroku build; use the locally
-            # installed EJS package and avoid an extra GitHub fetch on every call.
             opts["js_runtimes"] = {"node": {}}
 
         try:
@@ -952,13 +964,12 @@ def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
 
             media_url = info.get("url")
             if not media_url:
-                formats = info.get("formats") or []
                 audio = [
-                    f for f in formats
+                    f for f in (info.get("formats") or [])
                     if f.get("url") and f.get("acodec") not in (None, "none")
                     and f.get("vcodec") in (None, "none")
                 ]
-                audio.sort(key=lambda f: (f.get("abr") or 0), reverse=True)
+                audio.sort(key=lambda item: (item.get("abr") or 0), reverse=True)
                 if audio:
                     media_url = audio[0]["url"]
 
@@ -967,8 +978,7 @@ def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
 
             elapsed = round(time.perf_counter() - started, 3)
             _set_direct_cached(video_id, media_url)
-            logger.info("FAST audio resolved in %ss for %s using %s cookies=%s",
-                        elapsed, video_id, name, with_cookies)
+            logger.info("FAST audio resolved in %ss for %s using %s cookies=%s", elapsed, video_id, name, with_cookies)
             return {
                 "status": True,
                 "videoId": video_id,
@@ -981,11 +991,23 @@ def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
             }
         except Exception as exc:
             last_error = exc
-            logger.warning("FAST resolver %s failed after %ss: %s", name,
-                           round(time.perf_counter() - started, 3), exc)
+            logger.warning("FAST resolver %s failed after %ss: %s", name, round(time.perf_counter() - started, 3), exc)
 
     raise RuntimeError(str(last_error) if last_error else "Unable to resolve YouTube audio")
 
+
+def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
+    """Resolve a signed YouTube audio URL and coalesce duplicate requests."""
+    video_id = extract_video_id(url)
+    if not video_id:
+        raise RuntimeError("Invalid YouTube URL or video ID")
+
+    with _get_direct_resolve_lock(video_id):
+        cached = _get_direct_cached(video_id)
+        if cached:
+            return {"status": True, "videoId": video_id, "url": cached,
+                    "cached": True, "resolve_time": 0}
+        return _resolve_direct_audio_uncached(video_id)
 
 # =========================================================
 # AUDIO DOWNLOAD
@@ -1787,6 +1809,13 @@ async def search_youtube_music(
             20
         )
 
+        cache_key = f"{q.strip().casefold()}::{actual_limit}"
+        cached_results = _get_search_cached(cache_key)
+        if cached_results is not None:
+            if actual_limit == 1:
+                return cached_results[0] if cached_results else {}
+            return cached_results
+
         def perform_search():
 
             return ytmusic.search(
@@ -1846,6 +1875,8 @@ async def search_youtube_music(
                 "thumbnail":
                     thumbnail_url
             })
+
+        _set_search_cached(cache_key, formatted_results)
 
         logger.info(
             f"Successfully completed search "

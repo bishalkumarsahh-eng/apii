@@ -1,0 +1,15 @@
+# Music API performance update
+
+This archive contains the repository files with the performance update applied.
+
+Updated files:
+- app.py: coalesces duplicate direct-audio resolutions, adds bounded search/direct URL caches, and avoids per-request GitHub EJS downloads.
+- Procfile and start.sh: disable access logs and support WEB_CONCURRENCY.
+
+Secrets intentionally excluded: .env and cookies.txt. Copy those from your existing deployment; do not commit them.
+
+Validate after replacing files:
+```bash
+python -m py_compile app.py
+git diff --check
+```
