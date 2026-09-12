@@ -8,7 +8,8 @@ import urllib.request
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, Security
+from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -83,9 +84,13 @@ DB_FILE = "cache.db"
 
 API_KEY = os.getenv("API_KEY", "").strip()
 
+# Expose the header in Swagger UI so protected endpoints can be tested
+# with the Authorize button. Query and Bearer authentication remain supported.
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 
 async def require_api_key(
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_api_key: Optional[str] = Security(api_key_header),
     authorization: Optional[str] = Header(default=None),
     api_key: Optional[str] = Query(default=None, description="API key (legacy/query compatibility)")
 ):
