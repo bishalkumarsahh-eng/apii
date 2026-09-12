@@ -106,3 +106,7 @@ Authorization: Bearer YOUR_GENERATED_KEY
 
 Without a valid key these return HTTP `401`.
 If `API_KEY` is missing from Heroku, protected endpoints return HTTP `503` so an accidentally unsecured deployment is not possible.
+
+
+## Fast-download tuning
+The optimized build uses uvloop, avoids forced 10 MB HTTP chunking, uses 12 concurrent fragments, and reduces retry delays. Identical simultaneous downloads are deduplicated so only one YouTube download runs and the other request reuses the completed cache file.

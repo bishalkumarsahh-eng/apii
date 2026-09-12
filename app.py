@@ -5,6 +5,7 @@ import asyncio
 import sqlite3
 import logging
 import urllib.request
+import threading
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -74,6 +75,19 @@ COOKIES_FILE = "cookies.txt"
 
 DB_FILE = "cache.db"
 
+# Avoid duplicate downloads for the same track when multiple bot requests
+# arrive together. Different tracks are unaffected.
+_DOWNLOAD_LOCKS = {}
+_DOWNLOAD_LOCKS_GUARD = threading.Lock()
+
+def get_download_lock(key):
+    with _DOWNLOAD_LOCKS_GUARD:
+        lock = _DOWNLOAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _DOWNLOAD_LOCKS[key] = lock
+        return lock
+
 # =========================================================
 # API KEY AUTHENTICATION
 # =========================================================
@@ -129,35 +143,35 @@ async def require_api_key(
 CONCURRENT_FRAGMENT_DOWNLOADS = int(
     os.getenv(
         "CONCURRENT_FRAGMENT_DOWNLOADS",
-        "15"
+        "12"
     )
 )
 
 HTTP_CHUNK_SIZE = int(
     os.getenv(
         "HTTP_CHUNK_SIZE",
-        "10485760"
+        "0"
     )
 )
 
 SOCKET_TIMEOUT = int(
     os.getenv(
         "SOCKET_TIMEOUT",
-        "15"
+        "12"
     )
 )
 
 RETRIES = int(
     os.getenv(
         "RETRIES",
-        "5"
+        "2"
     )
 )
 
 FRAGMENT_RETRIES = int(
     os.getenv(
         "FRAGMENT_RETRIES",
-        "5"
+        "2"
     )
 )
 
@@ -1096,14 +1110,15 @@ def download_audio_sync(
 
     try:
 
-        with yt_dlp.YoutubeDL(
-            opts
-        ) as ydl:
+        with get_download_lock(video_id or url) as _download_lock:
+            with yt_dlp.YoutubeDL(
+                opts
+            ) as ydl:
 
-            info = ydl.extract_info(
-                url,
-                download=True
-            )
+                info = ydl.extract_info(
+                    url,
+                    download=True
+                )
 
             filename = ydl.prepare_filename(
                 info
@@ -1439,14 +1454,15 @@ def download_video_sync(
 
     try:
 
-        with yt_dlp.YoutubeDL(
-            opts
-        ) as ydl:
+        with get_download_lock(video_id or url) as _download_lock:
+            with yt_dlp.YoutubeDL(
+                opts
+            ) as ydl:
 
-            info = ydl.extract_info(
-                url,
-                download=True
-            )
+                info = ydl.extract_info(
+                    url,
+                    download=True
+                )
 
             filename = ydl.prepare_filename(
                 info
