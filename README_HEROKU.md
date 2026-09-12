@@ -8,12 +8,12 @@ Add these buildpacks to the Heroku app:
 
 ```bash
 heroku buildpacks:clear
+heroku buildpacks:add --index 1 https://github.com/heroku/heroku-buildpack-activestorage-preview
 heroku buildpacks:add heroku/python
 heroku buildpacks:add heroku/nodejs
-heroku buildpacks:add https://github.com/heroku/heroku-buildpack-apt
 ```
 
-The `Aptfile` installs FFmpeg. `package.json` provides Node.js for yt-dlp's EJS JavaScript runtime.
+The Active Storage Preview buildpack provides FFmpeg and FFprobe. `package.json` provides Node.js for yt-dlp's EJS JavaScript runtime. The `Aptfile` is not required for FFmpeg.
 
 ## Config Vars
 
@@ -100,9 +100,22 @@ Authorization: Bearer YOUR_GENERATED_KEY
 
 - `GET /search`
 - `GET /thumbnail`
+- `GET /stream`
 - `GET /download`
 - `GET /video`
 - `GET /files/{filename}`
 
 Without a valid key these return HTTP `401`.
 If `API_KEY` is missing from Heroku, protected endpoints return HTTP `503` so an accidentally unsecured deployment is not possible.
+
+## FAST AUDIO MODE
+For the fastest `/stream` and `/download?type=audio` paths, set:
+- `YOUTUBE_USE_COOKIES=false` for normal public music. Enable it only when
+  you intentionally provide a valid private cookies file and YouTube requires
+  it; stale cookies can make first-attempt extraction unreliable.
+- `COOKIE_URL=<your privately hosted cookies.txt URL>` (recommended when YouTube challenges the dyno)
+- `YOUTUBE_PLAYER_CLIENTS=default`
+
+The API resolves the signed YouTube media URL and proxies the audio bytes
+through the API server. This avoids HTTP 403 responses caused by a bot worker
+fetching a URL signed for a different server IP.

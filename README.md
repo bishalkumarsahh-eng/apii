@@ -91,3 +91,13 @@ Distributed under the MIT License.
 ## API Authentication
 
 Protected API endpoints require the `X-API-Key` header. Configure `API_KEY` in your hosting environment. `/` and `/health` remain public.
+
+## Fast audio streaming
+
+`/stream` and `/download?type=audio` resolve YouTube audio and proxy the
+stream through this API server. The bot should consume the proxied response
+instead of fetching the signed YouTube URL directly, because that URL can
+return HTTP 403 when fetched from a different server IP.
+
+Use `YOUTUBE_USE_COOKIES=false` for normal public music. Enable cookies only
+when YouTube requires a valid cookies file.
