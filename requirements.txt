@@ -1,7 +1,7 @@
 fastapi>=0.117.1
 httpx>=0.28.1
 uvicorn
-yt-dlp[default]
+yt-dlp[default]>=2026.08.19
 yt-dlp-ejs
 ytmusicapi
 python-dotenv

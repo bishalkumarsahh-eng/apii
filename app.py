@@ -59,7 +59,7 @@ COOKIE_URL = os.getenv("COOKIE_URL", "")
 # client that can cause "The page needs to be reloaded" errors.
 YOUTUBE_PLAYER_CLIENTS = os.getenv(
     "YOUTUBE_PLAYER_CLIENTS",
-    "web_embedded"
+    "default,web_embedded"
 ).strip()
 
 # YouTube can currently downgrade logged-in cookie sessions to the
@@ -890,62 +890,90 @@ def fetch_thumbnail_sync(
 # =========================================================
 
 def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
+    """Resolve a direct YouTube audio URL with the lowest practical latency.
+
+    Important: public music requests intentionally do NOT use the bundled browser
+    cookies. Stale/login cookies are currently known to trigger YouTube's
+    "The page needs to be reloaded" response and add several seconds of failed
+    extraction time. We use a small client set and stop as soon as one works.
+    """
     video_id = extract_video_id(url)
     if video_id:
         url = f"https://www.youtube.com/watch?v={video_id}"
         cached = _get_direct_cached(video_id)
         if cached:
-            return {"status": True, "videoId": video_id, "url": cached, "cached": True}
+            return {"status": True, "videoId": video_id, "url": cached, "cached": True, "resolve_time": 0}
 
-    opts = {
+    base = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 8,
-        "retries": 1,
-        "fragment_retries": 1,
+        "socket_timeout": 5,
+        "retries": 0,
+        "fragment_retries": 0,
         "nocheckcertificate": True,
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
-        },
-        "extractor_args": {
-            "youtube": [f"player_client={YOUTUBE_PLAYER_CLIENTS}"]
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
         },
     }
-    if YOUTUBE_USE_COOKIES and os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
+
+    # Current YouTube behavior can reject tv_downgraded and some cookie sessions.
+    # default + web_embedded is the preferred public/no-cookie path.
+    client_sets = [
+        os.getenv("YOUTUBE_PLAYER_CLIENTS", "default,web_embedded").strip(),
+        "default,web_embedded",
+    ]
+    # preserve order and avoid duplicate attempts
+    seen = set()
+    client_sets = [x for x in client_sets if x and not (x in seen or seen.add(x))]
 
     started = time.perf_counter()
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    last_error = None
+    for clients in client_sets:
+        opts = dict(base)
+        opts["extractor_args"] = {"youtube": [f"player_client={clients}"]}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            media_url = info.get("url")
+            if not media_url:
+                formats = info.get("formats") or []
+                audio = [
+                    f for f in formats
+                    if f.get("acodec") not in (None, "none")
+                    and f.get("vcodec") in (None, "none")
+                    and f.get("url")
+                ]
+                if audio:
+                    # Prefer m4a and then the highest bitrate among audio-only streams.
+                    audio.sort(key=lambda f: (f.get("ext") == "m4a", f.get("abr") or 0), reverse=True)
+                    media_url = audio[0]["url"]
+            if not media_url:
+                raise RuntimeError("No direct audio stream was returned by YouTube")
 
-    media_url = info.get("url")
-    if not media_url:
-        formats = info.get("formats") or []
-        audio = [f for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none") and f.get("url")]
-        if audio:
-            media_url = audio[-1]["url"]
-    if not media_url:
-        raise RuntimeError("No direct audio stream was returned by YouTube")
+            vid = info.get("id") or video_id
+            if vid:
+                _set_direct_cached(vid, media_url)
+            elapsed = round(time.perf_counter() - started, 3)
+            logger.info("Direct audio resolved in %ss for %s using %s", elapsed, vid or url, clients)
+            return {
+                "status": True,
+                "videoId": vid,
+                "title": info.get("title", ""),
+                "duration": info.get("duration", 0),
+                "thumbnail": info.get("thumbnail", ""),
+                "url": media_url,
+                "cached": False,
+                "resolve_time": elapsed,
+            }
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Direct audio extraction failed with client=%s: %s", clients, exc)
 
-    vid = info.get("id") or video_id
-    if vid:
-        _set_direct_cached(vid, media_url)
-
-    elapsed = round(time.perf_counter() - started, 3)
-    logger.info("Direct audio resolved in %ss for %s", elapsed, vid or url)
-    return {
-        "status": True,
-        "videoId": vid,
-        "title": info.get("title", ""),
-        "duration": info.get("duration", 0),
-        "thumbnail": info.get("thumbnail", ""),
-        "url": media_url,
-        "cached": False,
-        "resolve_time": elapsed,
-    }
+    raise RuntimeError(str(last_error) if last_error else "Unable to resolve YouTube audio")
 
 
 # =========================================================
