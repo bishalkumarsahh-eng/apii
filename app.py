@@ -868,6 +868,11 @@ def download_audio_sync(
         url
     )
 
+    # Accept both full YouTube URLs and the plain video IDs used by
+    # older Music Bot clients. yt-dlp needs a real URL to extract media.
+    if video_id and not re.match(r"^https?://", url):
+        url = f"https://www.youtube.com/watch?v={video_id}"
+
     # -----------------------------------------
     # DATABASE CACHE
     # -----------------------------------------
@@ -1214,6 +1219,11 @@ def download_video_sync(
     video_id = extract_video_id(
         url
     )
+
+    # Accept both full YouTube URLs and the plain video IDs used by
+    # older Music Bot clients. yt-dlp needs a real URL to extract media.
+    if video_id and not re.match(r"^https?://", url):
+        url = f"https://www.youtube.com/watch?v={video_id}"
 
     # -----------------------------------------
     # DATABASE CACHE
@@ -1796,16 +1806,49 @@ async def download_audio(
 
     url: str = Query(
         ...,
-        description="YouTube URL"
+        description="YouTube URL or video ID"
+    ),
+
+    type: Optional[str] = Query(
+        default=None,
+        description="Legacy Music Bot mode: audio or video"
     )
 ):
 
     try:
 
-        result = await asyncio.to_thread(
-            download_audio_sync,
-            url
-        )
+        requested_type = (type or "").strip().lower()
+        if requested_type not in ("", "audio", "video"):
+            raise HTTPException(
+                status_code=400,
+                detail="type must be audio or video"
+            )
+
+        # The legacy bot uses /download?type=video. Keep that contract
+        # working without changing the modern JSON response by default.
+        if requested_type == "video":
+            result = await asyncio.to_thread(
+                download_video_sync,
+                url
+            )
+        else:
+            result = await asyncio.to_thread(
+                download_audio_sync,
+                url
+            )
+
+        if requested_type:
+            file_path = result.get("path") if isinstance(result, dict) else None
+            if not file_path or not os.path.isfile(file_path):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Download completed without a readable file"
+                )
+            return FileResponse(
+                path=file_path,
+                filename=result.get("filename") or os.path.basename(file_path),
+                media_type="video/mp4" if requested_type == "video" else "audio/mpeg"
+            )
 
         return JSONResponse(
             content=result
