@@ -890,70 +890,61 @@ def fetch_thumbnail_sync(
 # =========================================================
 
 def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
-    """Resolve a direct audio URL with a low-latency YouTube strategy.
+    """Low-latency direct YouTube audio resolver.
 
-    The old implementation tried a cookie-backed web client first.  On a
-    Heroku dyno that can spend 10-15s doing browser/EJS work before returning.
-    The fast path now tries lightweight public clients first and only falls
-    back to the authenticated browser client when YouTube actually requires it.
+    Fast path is deliberately small: use the authenticated/default player client
+    when cookies are available, because this avoids wasting time on several
+    sequential clients that are likely to be bot-blocked on Heroku.  Fall back
+    to public clients only when no cookies are configured.
     """
     video_id = extract_video_id(url)
     if not video_id:
         raise RuntimeError("Invalid YouTube URL or video ID")
 
-    canonical = f"https://www.youtube.com/watch?v={video_id}"
     cached = _get_direct_cached(video_id)
     if cached:
         return {"status": True, "videoId": video_id, "url": cached,
                 "cached": True, "resolve_time": 0}
 
-    # Keep the first attempt deliberately small.  In particular, don't load
-    # cookies or remote EJS components unless a fallback actually needs them.
+    canonical = f"https://www.youtube.com/watch?v={video_id}"
+    use_cookies = YOUTUBE_USE_COOKIES and os.path.isfile(COOKIES_FILE)
+    started = time.perf_counter()
+
+    # IMPORTANT: don't request a narrow m4a format. Some player clients expose
+    # only WebM/Opus, which caused "Requested format is not available".
     common = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 4,
+        "socket_timeout": 3,
         "retries": 0,
         "fragment_retries": 0,
-        "nocheckcertificate": True,
-        "format": "bestaudio[ext=m4a]/bestaudio",
         "check_formats": False,
+        "format": "bestaudio/best",
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.8",
         },
     }
 
-    # Cheap clients first.  These avoid the expensive browser/EJS path on the
-    # majority of requests.  The authenticated web client remains a fallback.
-    attempts = [
-        ("android", False, {"youtube": ["player_client=android"]}),
-        ("web", False, {"youtube": ["player_client=web"]}),
-    ]
-
-    use_cookies = YOUTUBE_USE_COOKIES and os.path.isfile(COOKIES_FILE)
+    # One primary attempt. Sequentially trying android -> web -> embedded was
+    # causing 10-20 second failures before the API finally returned 500.
     if use_cookies:
-        attempts.extend([
-            ("web_embedded", True, {"youtube": ["player_client=web_embedded"]}),
-            ("default", True, {"youtube": ["player_client=default"]}),
-        ])
+        attempts = [("default", True)]
     else:
-        attempts.append(("web_embedded", False, {"youtube": ["player_client=web_embedded"]}))
+        attempts = [("android", False), ("web", False)]
 
-    started = time.perf_counter()
     last_error = None
-
-    for name, with_cookies, extractor_args in attempts:
+    for name, with_cookies in attempts:
         opts = dict(common)
-        opts["extractor_args"] = extractor_args
+        opts["extractor_args"] = {"youtube": [f"player_client={name}"]}
+
         if with_cookies:
             opts["cookiefile"] = COOKIES_FILE
-        # Only authenticated/browser clients need JS execution in this fast path.
-        if name in ("web_embedded", "default"):
+            # Node is already declared by the Heroku build; use the locally
+            # installed EJS package and avoid an extra GitHub fetch on every call.
             opts["js_runtimes"] = {"node": {}}
-            opts["remote_components"] = ["ejs:github"]
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -964,11 +955,10 @@ def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
                 formats = info.get("formats") or []
                 audio = [
                     f for f in formats
-                    if f.get("acodec") not in (None, "none")
+                    if f.get("url") and f.get("acodec") not in (None, "none")
                     and f.get("vcodec") in (None, "none")
-                    and f.get("url")
                 ]
-                audio.sort(key=lambda f: (f.get("ext") == "m4a", f.get("abr") or 0), reverse=True)
+                audio.sort(key=lambda f: (f.get("abr") or 0), reverse=True)
                 if audio:
                     media_url = audio[0]["url"]
 
@@ -991,8 +981,8 @@ def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
             }
         except Exception as exc:
             last_error = exc
-            elapsed = round(time.perf_counter() - started, 3)
-            logger.warning("FAST resolver %s failed after %ss: %s", name, elapsed, exc)
+            logger.warning("FAST resolver %s failed after %ss: %s", name,
+                           round(time.perf_counter() - started, 3), exc)
 
     raise RuntimeError(str(last_error) if last_error else "Unable to resolve YouTube audio")
 
