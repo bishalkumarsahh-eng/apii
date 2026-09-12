@@ -2115,25 +2115,6 @@ async def _proxy_direct_audio(url: str) -> StreamingResponse:
     return StreamingResponse(body(), media_type=content_type, headers=response_headers)
 
 
-@app.get("/stream")
-async def stream_audio(
-    _: bool = Depends(require_api_key),
-    url: str = Query(..., description="YouTube URL or video ID"),
-):
-    """Resolve and proxy audio so clients never fetch the signed URL directly."""
-    try:
-        return await _proxy_direct_audio(url)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Audio proxy error: %s", e)
-        raise HTTPException(status_code=502, detail={"error": "Audio proxy failed", "message": str(e)})
-
-
-# =========================================================
-# AUDIO DOWNLOAD API
-# =========================================================
-
 @app.get("/download")
 async def download_audio(
 
