@@ -8,12 +8,12 @@ Add these buildpacks to the Heroku app:
 
 ```bash
 heroku buildpacks:clear
-heroku buildpacks:add --index 1 https://github.com/heroku/heroku-buildpack-activestorage-preview
 heroku buildpacks:add heroku/python
 heroku buildpacks:add heroku/nodejs
+heroku buildpacks:add https://github.com/heroku/heroku-buildpack-apt
 ```
 
-The Active Storage Preview buildpack provides FFmpeg and FFprobe. `package.json` provides Node.js for yt-dlp's EJS JavaScript runtime. The `Aptfile` is not required for FFmpeg.
+The `Aptfile` installs FFmpeg. `package.json` provides Node.js for yt-dlp's EJS JavaScript runtime.
 
 ## Config Vars
 
@@ -106,11 +106,3 @@ Authorization: Bearer YOUR_GENERATED_KEY
 
 Without a valid key these return HTTP `401`.
 If `API_KEY` is missing from Heroku, protected endpoints return HTTP `503` so an accidentally unsecured deployment is not possible.
-
-## FAST AUDIO MODE
-For the fastest `/download?type=audio` path, set:
-- `YOUTUBE_USE_COOKIES=true`
-- `COOKIE_URL=<your privately hosted cookies.txt URL>` (recommended when YouTube challenges the dyno)
-- `YOUTUBE_PLAYER_CLIENTS=default`
-
-The audio endpoint resolves a signed YouTube media URL and returns a 302 redirect; it does not wait for a complete MP3 download or FFmpeg conversion.

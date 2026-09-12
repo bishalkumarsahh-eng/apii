@@ -3,15 +3,13 @@ import re
 import time
 import asyncio
 import sqlite3
-import threading
 import logging
 import urllib.request
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Header, Depends, Security
-from fastapi.security import APIKeyHeader
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from dotenv import load_dotenv
@@ -54,7 +52,10 @@ PORT = int(
     )
 )
 
-COOKIE_URL = os.getenv("COOKIE_URL", "")
+COOKIE_URL = os.getenv(
+    "COOKIE_URL",
+    ""
+)
 
 # YouTube player clients. Avoid the deprecated/problematic tv_downgraded
 # client that can cause "The page needs to be reloaded" errors.
@@ -62,14 +63,6 @@ YOUTUBE_PLAYER_CLIENTS = os.getenv(
     "YOUTUBE_PLAYER_CLIENTS",
     "default,web_embedded"
 ).strip()
-
-# YouTube can currently downgrade logged-in cookie sessions to the
-# tv_downgraded client, which may return "The page needs to be reloaded".
-# Public music/video downloads normally do not need account cookies.
-YOUTUBE_USE_COOKIES = os.getenv(
-    "YOUTUBE_USE_COOKIES",
-    "true"
-).strip().lower() in ("1", "true", "yes", "on")
 
 COOKIES_FILE = "cookies.txt"
 
@@ -85,13 +78,9 @@ DB_FILE = "cache.db"
 
 API_KEY = os.getenv("API_KEY", "").strip()
 
-# Expose the header in Swagger UI so protected endpoints can be tested
-# with the Authorize button. Query and Bearer authentication remain supported.
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
 
 async def require_api_key(
-    x_api_key: Optional[str] = Security(api_key_header),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None),
     api_key: Optional[str] = Query(default=None, description="API key (legacy/query compatibility)")
 ):
@@ -176,49 +165,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
-
-# =========================================================
-# DIRECT STREAM CACHE
-# =========================================================
-# YouTube media URLs are signed and expire. Keep them only briefly so a
-# repeated play request can skip the yt-dlp extraction step.
-DIRECT_URL_CACHE: Dict[str, tuple] = {}
-DIRECT_URL_CACHE_TTL = int(os.getenv("DIRECT_URL_CACHE_TTL", "900"))
-DIRECT_URL_CACHE_MAX = int(os.getenv("DIRECT_URL_CACHE_MAX", "2048"))
-DIRECT_CACHE_LOCK = threading.Lock()
-DIRECT_RESOLVE_LOCKS: Dict[str, threading.Lock] = {}
-DIRECT_RESOLVE_LOCKS_GUARD = threading.Lock()
-
-
-def _get_direct_cached(video_id: str):
-    with DIRECT_CACHE_LOCK:
-        item = DIRECT_URL_CACHE.get(video_id)
-        if not item:
-            return None
-        url, created = item
-        if time.time() - created >= DIRECT_URL_CACHE_TTL:
-            DIRECT_URL_CACHE.pop(video_id, None)
-            return None
-        return url
-
-
-def _set_direct_cached(video_id: str, media_url: str):
-    with DIRECT_CACHE_LOCK:
-        if len(DIRECT_URL_CACHE) >= DIRECT_URL_CACHE_MAX and video_id not in DIRECT_URL_CACHE:
-            oldest_id = min(DIRECT_URL_CACHE, key=lambda key: DIRECT_URL_CACHE[key][1])
-            DIRECT_URL_CACHE.pop(oldest_id, None)
-        DIRECT_URL_CACHE[video_id] = (media_url, time.time())
-
-
-def _get_direct_resolve_lock(video_id: str) -> threading.Lock:
-    # Coalesce simultaneous requests for the same song without serializing different songs.
-    with DIRECT_RESOLVE_LOCKS_GUARD:
-        lock = DIRECT_RESOLVE_LOCKS.get(video_id)
-        if lock is None:
-            lock = threading.Lock()
-            DIRECT_RESOLVE_LOCKS[video_id] = lock
-        return lock
 
 
 # =========================================================
@@ -671,7 +617,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="YouTube Downloader & Search API",
-    version="3.0.0-UltraFast",
+    version="2.3.0-Production",
     lifespan=lifespan
 )
 
@@ -742,27 +688,6 @@ except Exception as e:
 # =========================================================
 
 ytmusic = YTMusic()
-
-SEARCH_CACHE: Dict[str, tuple] = {}
-SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "120"))
-SEARCH_CACHE_MAX = int(os.getenv("SEARCH_CACHE_MAX", "512"))
-
-
-def _get_search_cached(key: str):
-    item = SEARCH_CACHE.get(key)
-    if not item:
-        return None
-    value, created = item
-    if time.time() - created >= SEARCH_CACHE_TTL:
-        SEARCH_CACHE.pop(key, None)
-        return None
-    return value
-
-
-def _set_search_cached(key: str, value):
-    if len(SEARCH_CACHE) >= SEARCH_CACHE_MAX and key not in SEARCH_CACHE:
-        SEARCH_CACHE.pop(next(iter(SEARCH_CACHE)), None)
-    SEARCH_CACHE[key] = (value, time.time())
 
 
 # =========================================================
@@ -853,10 +778,13 @@ def get_base_ydl_opts() -> Dict[str, Any]:
                 "node": {}
             },
 
-        # yt-dlp-ejs is installed locally; avoid a GitHub fetch on every download.
+        "remote_components":
+            [
+                "ejs:github"
+            ]
     }
 
-    if YOUTUBE_USE_COOKIES and os.path.exists(
+    if os.path.exists(
         COOKIES_FILE
     ):
 
@@ -867,11 +795,6 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         logger.info(
             f"Loaded cookies from "
             f"{COOKIES_FILE}"
-        )
-    elif os.path.exists(COOKIES_FILE):
-        logger.info(
-            "cookies.txt found but disabled for YouTube downloads "
-            "(YOUTUBE_USE_COOKIES=false)"
         )
 
     return opts
@@ -924,92 +847,6 @@ def fetch_thumbnail_sync(
 
 
 # =========================================================
-# ULTRA-FAST DIRECT AUDIO RESOLVER
-# =========================================================
-
-def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
-    canonical = f"https://www.youtube.com/watch?v={video_id}"
-    use_cookies = YOUTUBE_USE_COOKIES and os.path.isfile(COOKIES_FILE)
-    started = time.perf_counter()
-
-    common = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
-        "socket_timeout": int(os.getenv("YOUTUBE_SOCKET_TIMEOUT", "6")),
-        "retries": 0,
-        "fragment_retries": 0,
-        "check_formats": False,
-        "format": "bestaudio/best",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.8",
-        },
-    }
-
-    # Try one fast path first. Only fall back when the first client actually fails.
-    attempts = [("default", True)] if use_cookies else [("android", False), ("web", False)]
-    last_error = None
-    for name, with_cookies in attempts:
-        opts = dict(common)
-        opts["extractor_args"] = {"youtube": [f"player_client={name}"]}
-        if with_cookies:
-            opts["cookiefile"] = COOKIES_FILE
-            opts["js_runtimes"] = {"node": {}}
-
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(canonical, download=False)
-
-            media_url = info.get("url")
-            if not media_url:
-                audio = [
-                    f for f in (info.get("formats") or [])
-                    if f.get("url") and f.get("acodec") not in (None, "none")
-                    and f.get("vcodec") in (None, "none")
-                ]
-                audio.sort(key=lambda item: (item.get("abr") or 0), reverse=True)
-                if audio:
-                    media_url = audio[0]["url"]
-
-            if not media_url:
-                raise RuntimeError("No direct audio stream was returned")
-
-            elapsed = round(time.perf_counter() - started, 3)
-            _set_direct_cached(video_id, media_url)
-            logger.info("FAST audio resolved in %ss for %s using %s cookies=%s", elapsed, video_id, name, with_cookies)
-            return {
-                "status": True,
-                "videoId": video_id,
-                "title": info.get("title", ""),
-                "duration": info.get("duration", 0),
-                "thumbnail": info.get("thumbnail", ""),
-                "url": media_url,
-                "cached": False,
-                "resolve_time": elapsed,
-            }
-        except Exception as exc:
-            last_error = exc
-            logger.warning("FAST resolver %s failed after %ss: %s", name, round(time.perf_counter() - started, 3), exc)
-
-    raise RuntimeError(str(last_error) if last_error else "Unable to resolve YouTube audio")
-
-
-def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
-    """Resolve a signed YouTube audio URL and coalesce duplicate requests."""
-    video_id = extract_video_id(url)
-    if not video_id:
-        raise RuntimeError("Invalid YouTube URL or video ID")
-
-    with _get_direct_resolve_lock(video_id):
-        cached = _get_direct_cached(video_id)
-        if cached:
-            return {"status": True, "videoId": video_id, "url": cached,
-                    "cached": True, "resolve_time": 0}
-        return _resolve_direct_audio_uncached(video_id)
-
-# =========================================================
 # AUDIO DOWNLOAD
 # =========================================================
 
@@ -1020,11 +857,6 @@ def download_audio_sync(
     video_id = extract_video_id(
         url
     )
-
-    # Accept both full YouTube URLs and the plain video IDs used by
-    # older Music Bot clients. yt-dlp needs a real URL to extract media.
-    if video_id and not re.match(r"^https?://", url):
-        url = f"https://www.youtube.com/watch?v={video_id}"
 
     # -----------------------------------------
     # DATABASE CACHE
@@ -1167,8 +999,7 @@ def download_audio_sync(
     opts.update({
 
         "format":
-            # Prefer any available audio format; FFmpeg converts it to MP3.
-            "bestaudio/best",
+            "140/ba[ext=m4a]/bestaudio/best",
 
         "writethumbnail":
             False,
@@ -1374,11 +1205,6 @@ def download_video_sync(
         url
     )
 
-    # Accept both full YouTube URLs and the plain video IDs used by
-    # older Music Bot clients. yt-dlp needs a real URL to extract media.
-    if video_id and not re.match(r"^https?://", url):
-        url = f"https://www.youtube.com/watch?v={video_id}"
-
     # -----------------------------------------
     # DATABASE CACHE
     # -----------------------------------------
@@ -1520,10 +1346,10 @@ def download_video_sync(
     opts.update({
 
         "format":
-            # Do not require MP4/M4A streams; YouTube often exposes
-            # WebM or other formats depending on the player client.
-            f"bestvideo[height<={MAX_VIDEO_QUALITY}]"
-            f"+bestaudio/best[height<={MAX_VIDEO_QUALITY}]/best",
+            f"bv*[height<={MAX_VIDEO_QUALITY}]"
+            f"[ext=mp4]+ba[ext=m4a]/"
+            f"b[height<={MAX_VIDEO_QUALITY}]"
+            f"[ext=mp4]/best",
 
         "merge_output_format":
             "mp4",
@@ -1809,13 +1635,6 @@ async def search_youtube_music(
             20
         )
 
-        cache_key = f"{q.strip().casefold()}::{actual_limit}"
-        cached_results = _get_search_cached(cache_key)
-        if cached_results is not None:
-            if actual_limit == 1:
-                return cached_results[0] if cached_results else {}
-            return cached_results
-
         def perform_search():
 
             return ytmusic.search(
@@ -1875,8 +1694,6 @@ async def search_youtube_music(
                 "thumbnail":
                     thumbnail_url
             })
-
-        _set_search_cached(cache_key, formatted_results)
 
         logger.info(
             f"Successfully completed search "
@@ -1959,22 +1776,6 @@ async def get_thumbnail(
 
 
 # =========================================================
-# DIRECT AUDIO API
-# =========================================================
-
-@app.get("/direct")
-async def direct_audio(
-    _: bool = Depends(require_api_key),
-    url: str = Query(..., description="YouTube URL or video ID")
-):
-    try:
-        return JSONResponse(await asyncio.to_thread(resolve_direct_audio_sync, url))
-    except Exception as e:
-        logger.error("Direct audio API error: %s", e)
-        raise HTTPException(status_code=500, detail={"error": "Direct audio failed", "message": str(e)})
-
-
-# =========================================================
 # AUDIO DOWNLOAD API
 # =========================================================
 
@@ -1985,64 +1786,16 @@ async def download_audio(
 
     url: str = Query(
         ...,
-        description="YouTube URL or video ID"
-    ),
-
-    type: Optional[str] = Query(
-        default=None,
-        description="Legacy Music Bot mode: audio or video"
+        description="YouTube URL"
     )
 ):
 
     try:
 
-        requested_type = (type or "").strip().lower()
-        if requested_type not in ("", "audio", "video"):
-            raise HTTPException(
-                status_code=400,
-                detail="type must be audio or video"
-            )
-
-        # FAST AUDIO PATH: never download/convert the complete song on Heroku.
-        # Resolve YouTube's signed audio URL and redirect the client directly to it.
-        # HTTP clients normally follow the redirect automatically, so playback/download
-        # starts immediately instead of waiting for a full MP3 conversion.
-        if requested_type == "audio":
-            result = await asyncio.to_thread(resolve_direct_audio_sync, url)
-            return RedirectResponse(
-                url=result["url"],
-                status_code=302,
-                headers={
-                    "Cache-Control": "no-store",
-                    "X-API-Resolve-Time": str(result.get("resolve_time", "cached")),
-                },
-            )
-
-        # The legacy bot uses /download?type=video. Keep that contract
-        # working without changing the modern JSON response by default.
-        if requested_type == "video":
-            result = await asyncio.to_thread(
-                download_video_sync,
-                url
-            )
-        else:
-            result = await asyncio.to_thread(
-                download_audio_sync,
-                url
-            )
-
-        if requested_type:
-            file_path = result.get("path") if isinstance(result, dict) else None
-            if not file_path or not os.path.isfile(file_path):
-                raise HTTPException(
-                    status_code=500,
-                    detail="Download completed without a readable file"
-                )
-            return FileResponse(
-                path=file_path,
-                filename=result.get("filename") or os.path.basename(file_path),
-                media_type="video/mp4" if requested_type == "video" else "audio/mpeg"
-            )
+        result = await asyncio.to_thread(
+            download_audio_sync,
+            url
+        )
 
         return JSONResponse(
             content=result
