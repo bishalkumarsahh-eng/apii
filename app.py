@@ -890,68 +890,74 @@ def fetch_thumbnail_sync(
 # =========================================================
 
 def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
-    """Fast direct-audio resolver.
+    """Resolve a direct audio URL with a low-latency YouTube strategy.
 
-    Uses the same EJS/Node-enabled yt-dlp runtime as the working API, with an
-    optional cookie fallback.  The API never downloads the complete song on
-    this path; it only resolves YouTube's signed media URL and redirects the
-    client to it.
+    The old implementation tried a cookie-backed web client first.  On a
+    Heroku dyno that can spend 10-15s doing browser/EJS work before returning.
+    The fast path now tries lightweight public clients first and only falls
+    back to the authenticated browser client when YouTube actually requires it.
     """
     video_id = extract_video_id(url)
-    if video_id:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        cached = _get_direct_cached(video_id)
-        if cached:
-            return {"status": True, "videoId": video_id, "url": cached,
-                    "cached": True, "resolve_time": 0}
+    if not video_id:
+        raise RuntimeError("Invalid YouTube URL or video ID")
 
-    # Keep extraction lean: no playlist, no download, no retries on the first
-    # attempt. Node + yt-dlp-ejs is enabled because current YouTube clients
-    # require JS execution for reliable format extraction.
-    base = {
+    canonical = f"https://www.youtube.com/watch?v={video_id}"
+    cached = _get_direct_cached(video_id)
+    if cached:
+        return {"status": True, "videoId": video_id, "url": cached,
+                "cached": True, "resolve_time": 0}
+
+    # Keep the first attempt deliberately small.  In particular, don't load
+    # cookies or remote EJS components unless a fallback actually needs them.
+    common = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 6,
+        "socket_timeout": 4,
         "retries": 0,
         "fragment_retries": 0,
         "nocheckcertificate": True,
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio",
+        "check_formats": False,
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.8",
         },
-        "js_runtimes": {"node": {}},
-        "remote_components": ["ejs:github"],
     }
 
-    # Cookie support is essential when YouTube challenges the Heroku IP.
-    # Never hard-code credentials into the source; COOKIE_URL can populate the
-    # file at startup, or an externally supplied cookies.txt may be mounted.
+    # Cheap clients first.  These avoid the expensive browser/EJS path on the
+    # majority of requests.  The authenticated web client remains a fallback.
+    attempts = [
+        ("android", False, {"youtube": ["player_client=android"]}),
+        ("web", False, {"youtube": ["player_client=web"]}),
+    ]
+
     use_cookies = YOUTUBE_USE_COOKIES and os.path.isfile(COOKIES_FILE)
     if use_cookies:
-        base["cookiefile"] = COOKIES_FILE
-
-    configured = os.getenv("YOUTUBE_PLAYER_CLIENTS", "default").strip()
-    client_sets = [configured, "default"]
-    # A cookie-backed attempt is the primary path; public fallback is second.
-    if use_cookies:
-        client_sets = [configured, "default,web_embedded"]
+        attempts.extend([
+            ("web_embedded", True, {"youtube": ["player_client=web_embedded"]}),
+            ("default", True, {"youtube": ["player_client=default"]}),
+        ])
     else:
-        client_sets = [configured or "default", "default,web_embedded"]
-
-    seen = set()
-    client_sets = [c for c in client_sets if c and not (c in seen or seen.add(c))]
+        attempts.append(("web_embedded", False, {"youtube": ["player_client=web_embedded"]}))
 
     started = time.perf_counter()
     last_error = None
-    for clients in client_sets:
-        opts = dict(base)
-        opts["extractor_args"] = {"youtube": [f"player_client={clients}"]}
+
+    for name, with_cookies, extractor_args in attempts:
+        opts = dict(common)
+        opts["extractor_args"] = extractor_args
+        if with_cookies:
+            opts["cookiefile"] = COOKIES_FILE
+        # Only authenticated/browser clients need JS execution in this fast path.
+        if name in ("web_embedded", "default"):
+            opts["js_runtimes"] = {"node": {}}
+            opts["remote_components"] = ["ejs:github"]
+
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+                info = ydl.extract_info(canonical, download=False)
 
             media_url = info.get("url")
             if not media_url:
@@ -962,27 +968,20 @@ def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
                     and f.get("vcodec") in (None, "none")
                     and f.get("url")
                 ]
-                audio.sort(
-                    key=lambda f: (f.get("ext") == "m4a", f.get("abr") or 0),
-                    reverse=True,
-                )
+                audio.sort(key=lambda f: (f.get("ext") == "m4a", f.get("abr") or 0), reverse=True)
                 if audio:
                     media_url = audio[0]["url"]
 
             if not media_url:
-                raise RuntimeError("No direct audio stream was returned by YouTube")
+                raise RuntimeError("No direct audio stream was returned")
 
-            vid = info.get("id") or video_id
-            if vid:
-                _set_direct_cached(vid, media_url)
             elapsed = round(time.perf_counter() - started, 3)
-            logger.info(
-                "FAST audio resolved in %ss for %s using %s cookies=%s",
-                elapsed, vid or url, clients, use_cookies,
-            )
+            _set_direct_cached(video_id, media_url)
+            logger.info("FAST audio resolved in %ss for %s using %s cookies=%s",
+                        elapsed, video_id, name, with_cookies)
             return {
                 "status": True,
-                "videoId": vid,
+                "videoId": video_id,
                 "title": info.get("title", ""),
                 "duration": info.get("duration", 0),
                 "thumbnail": info.get("thumbnail", ""),
@@ -992,10 +991,8 @@ def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
             }
         except Exception as exc:
             last_error = exc
-            logger.warning(
-                "FAST audio extraction failed client=%s cookies=%s: %s",
-                clients, use_cookies, exc,
-            )
+            elapsed = round(time.perf_counter() - started, 3)
+            logger.warning("FAST resolver %s failed after %ss: %s", name, elapsed, exc)
 
     raise RuntimeError(str(last_error) if last_error else "Unable to resolve YouTube audio")
 
