@@ -1019,7 +1019,8 @@ def download_audio_sync(
     opts.update({
 
         "format":
-            "140/ba[ext=m4a]/bestaudio/best",
+            # Prefer any available audio format; FFmpeg converts it to MP3.
+            "bestaudio/best",
 
         "writethumbnail":
             False,
@@ -1371,10 +1372,10 @@ def download_video_sync(
     opts.update({
 
         "format":
-            f"bv*[height<={MAX_VIDEO_QUALITY}]"
-            f"[ext=mp4]+ba[ext=m4a]/"
-            f"b[height<={MAX_VIDEO_QUALITY}]"
-            f"[ext=mp4]/best",
+            # Do not require MP4/M4A streams; YouTube often exposes
+            # WebM or other formats depending on the player client.
+            f"bestvideo[height<={MAX_VIDEO_QUALITY}]"
+            f"+bestaudio/best[height<={MAX_VIDEO_QUALITY}]/best",
 
         "merge_output_format":
             "mp4",
