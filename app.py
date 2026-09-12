@@ -57,13 +57,6 @@ COOKIE_URL = os.getenv(
     ""
 )
 
-# YouTube player clients. Avoid the deprecated/problematic tv_downgraded
-# client that can cause "The page needs to be reloaded" errors.
-YOUTUBE_PLAYER_CLIENTS = os.getenv(
-    "YOUTUBE_PLAYER_CLIENTS",
-    "default,web_embedded"
-).strip()
-
 COOKIES_FILE = "cookies.txt"
 
 DB_FILE = "cache.db"
@@ -1022,7 +1015,7 @@ def download_audio_sync(
         "extractor_args": {
 
             "youtube": [
-                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
+                "player_client=ios,android,web"
             ]
         },
 
@@ -1363,7 +1356,7 @@ def download_video_sync(
         "extractor_args": {
 
             "youtube": [
-                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
+                "player_client=ios,android,web"
             ]
         },
 
