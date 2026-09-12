@@ -106,3 +106,11 @@ Authorization: Bearer YOUR_GENERATED_KEY
 
 Without a valid key these return HTTP `401`.
 If `API_KEY` is missing from Heroku, protected endpoints return HTTP `503` so an accidentally unsecured deployment is not possible.
+
+## FAST AUDIO MODE
+For the fastest `/download?type=audio` path, set:
+- `YOUTUBE_USE_COOKIES=true`
+- `COOKIE_URL=<your privately hosted cookies.txt URL>` (recommended when YouTube challenges the dyno)
+- `YOUTUBE_PLAYER_CLIENTS=default`
+
+The audio endpoint resolves a signed YouTube media URL and returns a 302 redirect; it does not wait for a complete MP3 download or FFmpeg conversion.
