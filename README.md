@@ -88,6 +88,3 @@ Distributed under the MIT License.
 <div align="center">
   <p>Made with ❤️ by <b>@Smugllers</b></p>
 </div>
-## API Authentication
-
-Protected API endpoints require the `X-API-Key` header. Configure `API_KEY` in your hosting environment. `/` and `/health` remain public.
