@@ -8,11 +8,9 @@ python-dotenv
 aiofiles
 psutil
 orjson
-uvloop
 watchdog
 prometheus-client
 opentelemetry-api
 opentelemetry-sdk
 opentelemetry-instrumentation-fastapi
 redis
-# Use Uvicorn default asyncio/h11 for broad Heroku Python compatibility.

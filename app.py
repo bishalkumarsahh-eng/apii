@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Header, Depends, Security
 from fastapi.security import APIKeyHeader
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from dotenv import load_dotenv
@@ -59,7 +59,7 @@ COOKIE_URL = os.getenv("COOKIE_URL", "")
 # client that can cause "The page needs to be reloaded" errors.
 YOUTUBE_PLAYER_CLIENTS = os.getenv(
     "YOUTUBE_PLAYER_CLIENTS",
-    "android,web"
+    "web_embedded"
 ).strip()
 
 # YouTube can currently downgrade logged-in cookie sessions to the
@@ -73,12 +73,6 @@ YOUTUBE_USE_COOKIES = os.getenv(
 COOKIES_FILE = "cookies.txt"
 
 DB_FILE = "cache.db"
-
-# Short-lived in-memory cache for signed YouTube media URLs.
-# This avoids a second yt-dlp extraction when the same track is requested again.
-DIRECT_URL_CACHE_TTL = int(os.getenv("DIRECT_URL_CACHE_TTL", "240"))
-DIRECT_URL_CACHE: Dict[str, tuple] = {}
-DIRECT_URL_LOCK = asyncio.Lock()
 
 # =========================================================
 # API KEY AUTHENTICATION
@@ -181,6 +175,30 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# DIRECT STREAM CACHE
+# =========================================================
+# YouTube media URLs are signed and expire. Keep them only briefly so a
+# repeated play request can skip the yt-dlp extraction step.
+DIRECT_URL_CACHE: Dict[str, tuple] = {}
+DIRECT_URL_CACHE_TTL = int(os.getenv("DIRECT_URL_CACHE_TTL", "900"))
+
+
+def _get_direct_cached(video_id: str):
+    item = DIRECT_URL_CACHE.get(video_id)
+    if not item:
+        return None
+    url, created = item
+    if time.time() - created >= DIRECT_URL_CACHE_TTL:
+        DIRECT_URL_CACHE.pop(video_id, None)
+        return None
+    return url
+
+
+def _set_direct_cached(video_id: str, media_url: str):
+    DIRECT_URL_CACHE[video_id] = (media_url, time.time())
 
 
 # =========================================================
@@ -633,7 +651,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="YouTube Downloader & Search API",
-    version="2.3.0-Production",
+    version="3.0.0-UltraFast",
     lifespan=lifespan
 )
 
@@ -868,101 +886,66 @@ def fetch_thumbnail_sync(
 
 
 # =========================================================
-# FAST DIRECT STREAM
+# ULTRA-FAST DIRECT AUDIO RESOLVER
 # =========================================================
 
-async def get_direct_audio_url(url: str) -> Dict[str, Any]:
-    """Extract a YouTube audio stream URL without downloading/transcoding it.
-
-    This is the key low-latency path: yt-dlp only resolves the signed media URL,
-    then the client downloads/streams directly from YouTube instead of waiting for
-    Heroku to download the entire file and run FFmpeg.
-    """
+def resolve_direct_audio_sync(url: str) -> Dict[str, Any]:
     video_id = extract_video_id(url)
     if video_id:
         url = f"https://www.youtube.com/watch?v={video_id}"
+        cached = _get_direct_cached(video_id)
+        if cached:
+            return {"status": True, "videoId": video_id, "url": cached, "cached": True}
 
-    cache_key = video_id or url
-    now = time.time()
-    cached = DIRECT_URL_CACHE.get(cache_key)
-    if cached and cached[0] > now:
-        return cached[1]
-
-    opts = get_base_ydl_opts()
-    opts.update({
-        "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
-        "skip_download": True,
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "extract_flat": False,
+        "skip_download": True,
         "socket_timeout": 8,
-        "retries": 2,
-        "fragment_retries": 2,
-        "http_chunk_size": None,
-        "extractor_args": {"youtube": [f"player_client={YOUTUBE_PLAYER_CLIENTS}"]},
-    })
+        "retries": 1,
+        "fragment_retries": 1,
+        "nocheckcertificate": True,
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+        },
+        "extractor_args": {
+            "youtube": [f"player_client={YOUTUBE_PLAYER_CLIENTS}"]
+        },
+    }
+    if YOUTUBE_USE_COOKIES and os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
 
-    def resolve():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            requested = info
-            if info.get("requested_formats"):
-                candidates = [f for f in info["requested_formats"] if f.get("acodec") not in (None, "none")]
-                if candidates:
-                    requested = candidates[0]
-            direct = requested.get("url")
-            if not direct:
-                raise RuntimeError("No direct audio stream was returned by YouTube")
-            return {
-                "status": True,
-                "title": info.get("title", ""),
-                "videoId": info.get("id") or video_id,
-                "duration": info.get("duration", 0),
-                "thumbnail": info.get("thumbnail", ""),
-                "uploader": info.get("uploader", ""),
-                "mime_type": requested.get("mime_type") or requested.get("ext", ""),
-                "ext": requested.get("ext", ""),
-                "acodec": requested.get("acodec", ""),
-                "abr": requested.get("abr"),
-                "direct_url": direct,
-                "expires": now + DIRECT_URL_CACHE_TTL,
-            }
+    started = time.perf_counter()
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
 
-    result = await asyncio.to_thread(resolve)
-    DIRECT_URL_CACHE[cache_key] = (time.time() + DIRECT_URL_CACHE_TTL, result)
-    return result
+    media_url = info.get("url")
+    if not media_url:
+        formats = info.get("formats") or []
+        audio = [f for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none") and f.get("url")]
+        if audio:
+            media_url = audio[-1]["url"]
+    if not media_url:
+        raise RuntimeError("No direct audio stream was returned by YouTube")
 
+    vid = info.get("id") or video_id
+    if vid:
+        _set_direct_cached(vid, media_url)
 
-@app.get("/stream")
-async def fast_stream(
-    _: bool = Depends(require_api_key),
-    url: str = Query(..., description="YouTube URL or video ID")
-):
-    """Low-latency audio endpoint. Returns a redirect to YouTube's direct audio stream."""
-    try:
-        result = await get_direct_audio_url(url)
-        return RedirectResponse(
-            url=result["direct_url"],
-            status_code=307,
-            headers={"Cache-Control": "no-store"}
-        )
-    except Exception as e:
-        logger.error(f"Fast stream error for {url}: {e}")
-        raise HTTPException(status_code=502, detail=f"Unable to resolve direct stream: {e}")
-
-
-@app.get("/direct")
-async def direct_audio(
-    _: bool = Depends(require_api_key),
-    url: str = Query(..., description="YouTube URL or video ID")
-):
-    """Resolve a direct YouTube audio URL as JSON without downloading the song."""
-    try:
-        return await get_direct_audio_url(url)
-    except Exception as e:
-        logger.error(f"Direct URL error for {url}: {e}")
-        raise HTTPException(status_code=502, detail=f"Unable to resolve direct stream: {e}")
+    elapsed = round(time.perf_counter() - started, 3)
+    logger.info("Direct audio resolved in %ss for %s", elapsed, vid or url)
+    return {
+        "status": True,
+        "videoId": vid,
+        "title": info.get("title", ""),
+        "duration": info.get("duration", 0),
+        "thumbnail": info.get("thumbnail", ""),
+        "url": media_url,
+        "cached": False,
+        "resolve_time": elapsed,
+    }
 
 
 # =========================================================
@@ -1906,6 +1889,22 @@ async def get_thumbnail(
 
 
 # =========================================================
+# DIRECT AUDIO API
+# =========================================================
+
+@app.get("/direct")
+async def direct_audio(
+    _: bool = Depends(require_api_key),
+    url: str = Query(..., description="YouTube URL or video ID")
+):
+    try:
+        return JSONResponse(await asyncio.to_thread(resolve_direct_audio_sync, url))
+    except Exception as e:
+        logger.error("Direct audio API error: %s", e)
+        raise HTTPException(status_code=500, detail={"error": "Direct audio failed", "message": str(e)})
+
+
+# =========================================================
 # AUDIO DOWNLOAD API
 # =========================================================
 
@@ -1922,11 +1921,6 @@ async def download_audio(
     type: Optional[str] = Query(
         default=None,
         description="Legacy Music Bot mode: audio or video"
-    ),
-
-    fast: bool = Query(
-        default=False,
-        description="For audio: redirect immediately to YouTube's direct stream instead of downloading/transcoding"
     )
 ):
 
@@ -1939,20 +1933,27 @@ async def download_audio(
                 detail="type must be audio or video"
             )
 
+        # FAST AUDIO PATH: never download/convert the complete song on Heroku.
+        # Resolve YouTube's signed audio URL and redirect the client directly to it.
+        # HTTP clients normally follow the redirect automatically, so playback/download
+        # starts immediately instead of waiting for a full MP3 conversion.
+        if requested_type == "audio":
+            result = await asyncio.to_thread(resolve_direct_audio_sync, url)
+            return RedirectResponse(
+                url=result["url"],
+                status_code=302,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-API-Resolve-Time": str(result.get("resolve_time", "cached")),
+                },
+            )
+
         # The legacy bot uses /download?type=video. Keep that contract
         # working without changing the modern JSON response by default.
         if requested_type == "video":
             result = await asyncio.to_thread(
                 download_video_sync,
                 url
-            )
-        elif fast:
-            # Low-latency path: no local download and no FFmpeg conversion.
-            result = await get_direct_audio_url(url)
-            return RedirectResponse(
-                url=result["direct_url"],
-                status_code=307,
-                headers={"Cache-Control": "no-store"}
             )
         else:
             result = await asyncio.to_thread(
