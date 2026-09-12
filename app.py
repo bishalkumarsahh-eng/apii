@@ -632,13 +632,10 @@ async def lifespan(app: FastAPI):
                 COOKIES_FILE
             )
 
-            if os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) >= 50:
-                logger.info(
-                    "Successfully downloaded cookies.txt from COOKIE_URL (%d bytes)",
-                    os.path.getsize(COOKIES_FILE),
-                )
-            else:
-                logger.error("COOKIE_URL returned an empty/invalid cookies.txt")
+            logger.info(
+                "Successfully downloaded "
+                "cookies.txt from COOKIE_URL"
+            )
 
         except Exception as e:
 
@@ -646,12 +643,6 @@ async def lifespan(app: FastAPI):
                 f"Failed to download cookies "
                 f"from COOKIE_URL: {e}"
             )
-
-    if YOUTUBE_USE_COOKIES and not os.path.isfile(COOKIES_FILE):
-        logger.warning(
-            "YouTube cookies are enabled but %s is missing. Set COOKIE_URL or provide a secure cookies.txt at startup.",
-            COOKIES_FILE,
-        )
 
     # -----------------------------------------
     # Start cleanup worker
@@ -946,7 +937,7 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": int(os.getenv("YOUTUBE_SOCKET_TIMEOUT", "10")),
+        "socket_timeout": int(os.getenv("YOUTUBE_SOCKET_TIMEOUT", "6")),
         "retries": 0,
         "fragment_retries": 0,
         "check_formats": False,
@@ -957,18 +948,8 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         },
     }
 
-    # Prefer authenticated extraction when a valid cookie file is available,
-    # then fall back through alternate YouTube clients if that client/session is challenged.
-    configured_clients = [
-        item.strip()
-        for item in os.getenv("YOUTUBE_PLAYER_CLIENTS", "default,web_embedded").split(",")
-        if item.strip()
-    ]
-    attempts = []
-    if use_cookies:
-        attempts.extend((name, True) for name in configured_clients)
-    attempts.extend((name, False) for name in ("android", "web"))
-    attempts = list(dict.fromkeys(attempts))
+    # Try one fast path first. Only fall back when the first client actually fails.
+    attempts = [("default", True)] if use_cookies else [("android", False), ("web", False)]
     last_error = None
     for name, with_cookies in attempts:
         opts = dict(common)
