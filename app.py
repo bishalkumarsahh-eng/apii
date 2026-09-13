@@ -1,4 +1,6 @@
 import os
+# === SPEED OPTIMIZATION V2 ===
+# Defaults are tuned for Heroku: moderate concurrency and low retry overhead.
 import re
 import time
 import asyncio
@@ -996,7 +998,7 @@ def download_audio_sync(
     opts.update({
 
         "format":
-            "140/ba[ext=m4a]/bestaudio/best",
+            "ba[ext=m4a]/ba[ext=webm]/bestaudio/best",
 
         "writethumbnail":
             False,
