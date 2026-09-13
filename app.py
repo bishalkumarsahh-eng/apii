@@ -1862,6 +1862,82 @@ async def download_video(
         )
 
 
+
+# =========================================================
+# DIRECT MEDIA STREAMING API
+# =========================================================
+
+@app.get("/stream")
+async def stream_audio(
+    _: bool = Depends(require_api_key),
+    url: str = Query(..., description="YouTube URL or video ID")
+):
+    """Download audio on the server and stream the finished MP3 directly.
+
+    This endpoint is optimized for music bots: one HTTP request and no
+    intermediate JSON -> /files round trip.
+    """
+    try:
+        result = await asyncio.to_thread(download_audio_sync, url)
+        if not result or not result.get("status"):
+            raise HTTPException(status_code=500, detail="Audio download failed")
+
+        file_path = result.get("path")
+        filename = os.path.basename(result.get("filename") or file_path or "audio.mp3")
+        if not file_path or not os.path.isfile(file_path):
+            raise HTTPException(status_code=404, detail="Downloaded audio file not found")
+
+        file_size = os.path.getsize(file_path)
+        if file_size <= 1024:
+            raise HTTPException(status_code=500, detail="Downloaded audio file is empty")
+
+        logger.info(f"Direct audio stream ready: {filename} ({file_size / 1048576:.2f} MB)")
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type="audio/mpeg",
+            headers={"Cache-Control": "no-store"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Direct audio stream error for {url}: {e}")
+        raise HTTPException(status_code=500, detail="Audio streaming failed")
+
+
+@app.get("/video-stream")
+async def stream_video(
+    _: bool = Depends(require_api_key),
+    url: str = Query(..., description="YouTube URL or video ID")
+):
+    """Download video on the server and stream the finished file directly."""
+    try:
+        result = await asyncio.to_thread(download_video_sync, url)
+        if not result or not result.get("status"):
+            raise HTTPException(status_code=500, detail="Video download failed")
+
+        file_path = result.get("path")
+        filename = os.path.basename(result.get("filename") or file_path or "video.mp4")
+        if not file_path or not os.path.isfile(file_path):
+            raise HTTPException(status_code=404, detail="Downloaded video file not found")
+
+        file_size = os.path.getsize(file_path)
+        if file_size <= 1024:
+            raise HTTPException(status_code=500, detail="Downloaded video file is empty")
+
+        logger.info(f"Direct video stream ready: {filename} ({file_size / 1048576:.2f} MB)")
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type="video/mp4",
+            headers={"Cache-Control": "no-store"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Direct video stream error for {url}: {e}")
+        raise HTTPException(status_code=500, detail="Video streaming failed")
+
 # =========================================================
 # FILE SERVING
 # =========================================================

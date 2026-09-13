@@ -13,3 +13,7 @@ Validate after replacing files:
 python -m py_compile app.py
 git diff --check
 ```
+
+
+## Direct bot streaming
+Use `/stream?url=VIDEO_ID` for audio and `/video-stream?url=VIDEO_ID` for video. These endpoints return the media directly after the server finishes the yt-dlp download, avoiding the JSON metadata + second `/files/...` request used by `/download`.
