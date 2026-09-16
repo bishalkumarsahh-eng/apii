@@ -1125,12 +1125,10 @@ def download_audio_sync(
         url
     )
 
-    # ShrutiBots is the primary audio resolver. If it fails, continue with
-    # the existing cache/yt-dlp implementation below.
-    if video_id:
-        shruti_result = download_audio_shruti(video_id)
-        if shruti_result:
-            return shruti_result
+    # FAST LOCAL RESOLUTION IS PRIMARY.
+    # The remote ShrutiBots resolver can have 10-15s upstream preparation
+    # time, so do not pay that latency before checking cache + fast yt-dlp.
+    # ShrutiBots remains an automatic fallback below.
 
     # -----------------------------------------
     # DATABASE CACHE
@@ -1268,6 +1266,11 @@ def download_audio_sync(
         fast_result = download_audio_fast(video_id)
         if fast_result:
             return fast_result
+
+        # Remote ShrutiBots fallback only after the fast local path fails.
+        shruti_result = download_audio_shruti(video_id)
+        if shruti_result:
+            return shruti_result
 
     # -----------------------------------------
     # ACTUAL DOWNLOAD
