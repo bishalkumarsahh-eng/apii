@@ -77,6 +77,18 @@ DB_FILE = "cache.db"
 
 API_KEY = os.getenv("API_KEY", "").strip()
 
+# ShrutiBots audio downloader (Priority 1). Keep the key in Heroku Config Vars.
+SHRUTI_API_URL = os.getenv(
+    "SHRUTI_API_URL",
+    "https://api01.shrutibots.site"
+).rstrip("/")
+
+SHRUTI_API_KEY = os.getenv(
+    "SHRUTI_API_KEY",
+    ""
+).strip()
+
+
 
 async def require_api_key(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
@@ -849,6 +861,149 @@ def fetch_thumbnail_sync(
 # AUDIO DOWNLOAD
 # =========================================================
 
+
+# =========================================================
+# SHRUTIBOTS AUDIO DOWNLOADER
+# =========================================================
+
+def download_audio_shruti(
+    video_id: str
+) -> Optional[Dict[str, Any]]:
+    """Try ShrutiBots first and save its returned audio into DOWNLOAD_DIR.
+
+    Supports either a direct audio response or JSON containing a downloadable URL.
+    Returns the same metadata shape used by the existing downloader, or None on failure.
+    """
+    if not SHRUTI_API_KEY:
+        logger.warning("ShrutiBots API key is not configured; using yt-dlp fallback.")
+        return None
+
+    api_url = f"{SHRUTI_API_URL}/download"
+    params = {
+        "url": video_id,
+        "type": "audio",
+        "api_key": SHRUTI_API_KEY,
+    }
+
+    try:
+        logger.info(
+            f"🚀 [PRIORITY 1] Trying ShrutiBots API for {video_id} (type: audio)"
+        )
+
+        query = urllib.parse.urlencode(params)
+        request = urllib.request.Request(
+            f"{api_url}?{query}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+
+        with urllib.request.urlopen(request, timeout=45) as response:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            body = response.read()
+
+        # Direct audio/file response.
+        if body and (
+            content_type.startswith("audio/")
+            or "application/octet-stream" in content_type
+        ):
+            ext = "mp3" if "mpeg" in content_type or "mp3" in content_type else "audio"
+            filename = f"{video_id}.{ext}"
+            path = os.path.join(DOWNLOAD_DIR, filename)
+            with open(path, "wb") as f:
+                f.write(body)
+            if os.path.getsize(path) > 0:
+                logger.info(
+                    f"✅ [SHRUTI SUCCESS] Downloaded: {path} "
+                    f"({os.path.getsize(path) / 1024 / 1024:.2f} MB)"
+                )
+                data = {
+                    "status": True,
+                    "title": video_id,
+                    "duration": 0,
+                    "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                    "filename": filename,
+                    "path": path,
+                    "download_url": f"/files/{filename}",
+                    "videoId": video_id,
+                    "uploader": "ShrutiBots",
+                    "filesize": os.path.getsize(path),
+                }
+                save_cached_metadata(data, "mp3")
+                return data
+
+        # JSON response containing a remote audio URL.
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+
+        def find_url(obj):
+            if isinstance(obj, str) and obj.startswith(("http://", "https://")):
+                return obj
+            if isinstance(obj, dict):
+                for key in (
+                    "download_url", "audio_url", "url", "link",
+                    "download", "file", "audio", "result", "data"
+                ):
+                    if key in obj:
+                        found = find_url(obj[key])
+                        if found:
+                            return found
+                for value in obj.values():
+                    found = find_url(value)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for value in obj:
+                    found = find_url(value)
+                    if found:
+                        return found
+            return None
+
+        remote_url = find_url(payload)
+        if not remote_url:
+            raise RuntimeError("ShrutiBots response did not contain an audio URL")
+
+        logger.info(f"📥 [SHRUTI] Downloading audio for {video_id}...")
+        audio_request = urllib.request.Request(
+            remote_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(audio_request, timeout=90) as response:
+            audio_body = response.read()
+
+        if not audio_body:
+            raise RuntimeError("ShrutiBots returned an empty audio file")
+
+        filename = f"{video_id}.mp3"
+        path = os.path.join(DOWNLOAD_DIR, filename)
+        with open(path, "wb") as f:
+            f.write(audio_body)
+
+        if os.path.getsize(path) <= 0:
+            raise RuntimeError("Saved ShrutiBots audio file is empty")
+
+        logger.info(
+            f"📦 [SHRUTI] File size: {os.path.getsize(path) / 1024 / 1024:.2f} MB"
+        )
+        logger.info(f"✅ [SHRUTI SUCCESS] Downloaded: {path}")
+
+        data = {
+            "status": True,
+            "title": video_id,
+            "duration": 0,
+            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            "filename": filename,
+            "path": path,
+            "download_url": f"/files/{filename}",
+            "videoId": video_id,
+            "uploader": "ShrutiBots",
+            "filesize": os.path.getsize(path),
+        }
+        save_cached_metadata(data, "mp3")
+        return data
+
+    except Exception as e:
+        logger.warning(f"⚠️ [SHRUTI FAILED] {video_id}: {e}")
+        return None
+
+
 def download_audio_sync(
     url: str
 ) -> Dict[str, Any]:
@@ -856,6 +1011,13 @@ def download_audio_sync(
     video_id = extract_video_id(
         url
     )
+
+    # ShrutiBots is the primary audio resolver. If it fails, continue with
+    # the existing cache/yt-dlp implementation below.
+    if video_id:
+        shruti_result = download_audio_shruti(video_id)
+        if shruti_result:
+            return shruti_result
 
     # -----------------------------------------
     # DATABASE CACHE
