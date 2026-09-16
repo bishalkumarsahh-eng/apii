@@ -7,6 +7,7 @@ import asyncio
 import sqlite3
 import logging
 import urllib.request
+import subprocess
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -60,7 +61,7 @@ COOKIE_URL = os.getenv("COOKIE_URL", "")
 # client that can cause "The page needs to be reloaded" errors.
 YOUTUBE_PLAYER_CLIENTS = os.getenv(
     "YOUTUBE_PLAYER_CLIENTS",
-    "default,web_embedded"
+    "web_embedded,default"
 ).strip()
 
 COOKIES_FILE = "cookies.txt"
@@ -866,65 +867,13 @@ def fetch_thumbnail_sync(
 # SHRUTIBOTS AUDIO DOWNLOADER
 # =========================================================
 
-def _stream_http_to_file(response, path: str, video_id: str, label: str = "API") -> int:
-    """Stream an HTTP response directly to disk instead of buffering the whole file."""
-    os.makedirs(os.path.dirname(path) or DOWNLOAD_DIR, exist_ok=True)
-    temp_path = f"{path}.part"
-    total = 0
-    last_logged_mb = -1
-
-    try:
-        with open(temp_path, "wb") as f:
-            while True:
-                chunk = response.read(256 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                total += len(chunk)
-
-                current_mb = total // (1024 * 1024)
-                if current_mb > last_logged_mb:
-                    last_logged_mb = current_mb
-                    content_length = response.headers.get("Content-Length")
-                    if content_length:
-                        try:
-                            expected = int(content_length)
-                            pct = (total / expected) * 100 if expected else 0
-                            logger.info(
-                                f"📊 [{label}] Progress: {total / 1024 / 1024:.1f}/"
-                                f"{expected / 1024 / 1024:.1f} MB ({pct:.1f}%)"
-                            )
-                        except (TypeError, ValueError):
-                            logger.info(
-                                f"📊 [{label}] Downloaded: {total / 1024 / 1024:.1f} MB"
-                            )
-                    else:
-                        logger.info(
-                            f"📊 [{label}] Downloaded: {total / 1024 / 1024:.1f} MB"
-                        )
-
-        if total <= 0:
-            raise RuntimeError("API returned an empty audio file")
-
-        os.replace(temp_path, path)
-        return total
-    except Exception:
-        try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-        except OSError:
-            pass
-        raise
-
-
 def download_audio_shruti(
     video_id: str
 ) -> Optional[Dict[str, Any]]:
-    """Download audio through ShrutiBots with low-memory streaming.
+    """Try ShrutiBots first and save its returned audio into DOWNLOAD_DIR.
 
-    The API may return either the audio bytes directly or JSON containing a
-    remote audio URL. Direct audio is streamed immediately to disk. Remote
-    audio is also streamed in chunks, avoiding response.read() buffering.
+    Supports either a direct audio response or JSON containing a downloadable URL.
+    Returns the same metadata shape used by the existing downloader, or None on failure.
     """
     if not SHRUTI_API_KEY:
         logger.warning("ShrutiBots API key is not configured; using yt-dlp fallback.")
@@ -937,23 +886,6 @@ def download_audio_shruti(
         "api_key": SHRUTI_API_KEY,
     }
 
-    def build_data(filename: str, path: str, uploader: str = "ShrutiBots"):
-        size = os.path.getsize(path)
-        data = {
-            "status": True,
-            "title": video_id,
-            "duration": 0,
-            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-            "filename": filename,
-            "path": path,
-            "download_url": f"/files/{filename}",
-            "videoId": video_id,
-            "uploader": uploader,
-            "filesize": size,
-        }
-        save_cached_metadata(data, "mp3")
-        return data
-
     try:
         logger.info(
             f"🚀 [PRIORITY 1] Trying ShrutiBots API for {video_id} (type: audio)"
@@ -962,38 +894,44 @@ def download_audio_shruti(
         query = urllib.parse.urlencode(params)
         request = urllib.request.Request(
             f"{api_url}?{query}",
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "audio/mpeg,audio/*,application/json;q=0.9,*/*;q=0.5",
-                "Accept-Encoding": "identity",
-                "Connection": "keep-alive",
-            },
+            headers={"User-Agent": "Mozilla/5.0"},
         )
 
-        # Keep the resolver timeout separate from the actual transfer. Once the
-        # server starts returning bytes, urllib can continue reading normally.
         with urllib.request.urlopen(request, timeout=45) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
-
-            # Direct audio response: stream immediately instead of response.read().
-            if content_type.startswith("audio/") or "application/octet-stream" in content_type:
-                ext = "mp3" if ("mpeg" in content_type or "mp3" in content_type) else "audio"
-                filename = f"{video_id}.{ext}"
-                path = os.path.join(DOWNLOAD_DIR, filename)
-
-                logger.info(f"📥 [SHRUTI] Streaming audio for {video_id}...")
-                size = _stream_http_to_file(response, path, video_id, "SHRUTI")
-
-                logger.info(
-                    f"✅ [SHRUTI SUCCESS] Downloaded: {path} "
-                    f"({size / 1024 / 1024:.2f} MB)"
-                )
-                return build_data(filename, path)
-
-            # JSON responses are normally small, so buffering only this resolver
-            # response is fine. The actual MP3 is streamed below.
             body = response.read()
 
+        # Direct audio/file response.
+        if body and (
+            content_type.startswith("audio/")
+            or "application/octet-stream" in content_type
+        ):
+            ext = "mp3" if "mpeg" in content_type or "mp3" in content_type else "audio"
+            filename = f"{video_id}.{ext}"
+            path = os.path.join(DOWNLOAD_DIR, filename)
+            with open(path, "wb") as f:
+                f.write(body)
+            if os.path.getsize(path) > 0:
+                logger.info(
+                    f"✅ [SHRUTI SUCCESS] Downloaded: {path} "
+                    f"({os.path.getsize(path) / 1024 / 1024:.2f} MB)"
+                )
+                data = {
+                    "status": True,
+                    "title": video_id,
+                    "duration": 0,
+                    "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                    "filename": filename,
+                    "path": path,
+                    "download_url": f"/files/{filename}",
+                    "videoId": video_id,
+                    "uploader": "ShrutiBots",
+                    "filesize": os.path.getsize(path),
+                }
+                save_cached_metadata(data, "mp3")
+                return data
+
+        # JSON response containing a remote audio URL.
         payload = json.loads(body.decode("utf-8", errors="replace"))
 
         def find_url(obj):
@@ -1026,26 +964,157 @@ def download_audio_shruti(
         logger.info(f"📥 [SHRUTI] Downloading audio for {video_id}...")
         audio_request = urllib.request.Request(
             remote_url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "audio/mpeg,audio/*,*/*;q=0.8",
-                "Accept-Encoding": "identity",
-                "Connection": "keep-alive",
-            },
+            headers={"User-Agent": "Mozilla/5.0"},
         )
+        with urllib.request.urlopen(audio_request, timeout=90) as response:
+            audio_body = response.read()
+
+        if not audio_body:
+            raise RuntimeError("ShrutiBots returned an empty audio file")
 
         filename = f"{video_id}.mp3"
         path = os.path.join(DOWNLOAD_DIR, filename)
-        with urllib.request.urlopen(audio_request, timeout=90) as response:
-            size = _stream_http_to_file(response, path, video_id, "SHRUTI")
+        with open(path, "wb") as f:
+            f.write(audio_body)
 
-        logger.info(f"📦 [SHRUTI] File size: {size / 1024 / 1024:.2f} MB")
+        if os.path.getsize(path) <= 0:
+            raise RuntimeError("Saved ShrutiBots audio file is empty")
+
+        logger.info(
+            f"📦 [SHRUTI] File size: {os.path.getsize(path) / 1024 / 1024:.2f} MB"
+        )
         logger.info(f"✅ [SHRUTI SUCCESS] Downloaded: {path}")
-        return build_data(filename, path)
+
+        data = {
+            "status": True,
+            "title": video_id,
+            "duration": 0,
+            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            "filename": filename,
+            "path": path,
+            "download_url": f"/files/{filename}",
+            "videoId": video_id,
+            "uploader": "ShrutiBots",
+            "filesize": os.path.getsize(path),
+        }
+        save_cached_metadata(data, "mp3")
+        return data
 
     except Exception as e:
         logger.warning(f"⚠️ [SHRUTI FAILED] {video_id}: {e}")
         return None
+
+
+def download_audio_fast(video_id: str) -> Optional[Dict[str, Any]]:
+    """Fast audio path: resolve a single embeddable audio format first.
+
+    This avoids a full MP3 post-processing download on the first attempt.
+    If the video is not available through the fast client, callers should
+    fall back to the normal yt-dlp path.
+    """
+    fast_clients = os.getenv("FAST_YOUTUBE_PLAYER_CLIENTS", "web_embedded").strip()
+    if not fast_clients:
+        return None
+
+    source_path = None
+    try:
+        started = time.perf_counter()
+        logger.info(f"⚡ [FAST PATH] Resolving audio for {video_id} using {fast_clients}")
+
+        opts = get_base_ydl_opts()
+        opts.update({
+            "format": "ba[ext=m4a]/ba[ext=webm]/bestaudio",
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "nocheckcertificate": True,
+            "socket_timeout": min(SOCKET_TIMEOUT, 10),
+            "retries": 2,
+            "fragment_retries": 2,
+            "extractor_args": {"youtube": [f"player_client={fast_clients}"]},
+        })
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}",
+                download=False,
+            )
+            fmt = info
+            if info.get("requested_formats"):
+                fmt = info["requested_formats"][0]
+            media_url = fmt.get("url")
+            if not media_url:
+                return None
+
+            ext = (fmt.get("ext") or "m4a").lower()
+            source_path = os.path.join(DOWNLOAD_DIR, f".{video_id}.source.{ext}")
+            final_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
+
+            logger.info(f"⚡ [FAST PATH] URL resolved in {time.perf_counter() - started:.2f}s; downloading source")
+            req = urllib.request.Request(
+                media_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "*/*",
+                    "Connection": "keep-alive",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=45) as response, open(source_path, "wb") as out:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+
+        if not os.path.isfile(source_path) or os.path.getsize(source_path) <= 0:
+            return None
+
+        # Convert locally only after the source has arrived. This keeps the
+        # network path fast while preserving the existing MP3 API contract.
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", source_path,
+                "-vn", "-sn",
+                "-codec:a", "libmp3lame",
+                "-b:a", "192k",
+                final_path,
+            ],
+            check=True,
+            timeout=120,
+        )
+
+        if not os.path.isfile(final_path) or os.path.getsize(final_path) <= 0:
+            return None
+
+        data = {
+            "status": True,
+            "title": info.get("title", video_id),
+            "duration": info.get("duration", 0),
+            "thumbnail": info.get("thumbnail", f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
+            "filename": os.path.basename(final_path),
+            "path": final_path,
+            "download_url": f"/files/{os.path.basename(final_path)}",
+            "videoId": info.get("id", video_id),
+            "uploader": info.get("uploader", "YouTube"),
+            "filesize": os.path.getsize(final_path),
+        }
+        save_cached_metadata(data, "mp3")
+        logger.info(
+            f"🚀 [FAST SUCCESS] {video_id}: {os.path.getsize(final_path) / 1048576:.2f} MB "
+            f"in {time.perf_counter() - started:.2f}s"
+        )
+        return data
+    except Exception as e:
+        logger.info(f"↩️ [FAST FALLBACK] {video_id}: {e}")
+        return None
+    finally:
+        if source_path and os.path.exists(source_path):
+            try:
+                os.remove(source_path)
+            except OSError:
+                pass
 
 
 def download_audio_sync(
@@ -1190,6 +1259,15 @@ def download_audio_sync(
                 data["uploader"] = "Cached"
 
                 return data
+
+    # -----------------------------------------
+    # FAST DIRECT AUDIO PATH
+    # -----------------------------------------
+
+    if video_id:
+        fast_result = download_audio_fast(video_id)
+        if fast_result:
+            return fast_result
 
     # -----------------------------------------
     # ACTUAL DOWNLOAD
