@@ -866,13 +866,65 @@ def fetch_thumbnail_sync(
 # SHRUTIBOTS AUDIO DOWNLOADER
 # =========================================================
 
+def _stream_http_to_file(response, path: str, video_id: str, label: str = "API") -> int:
+    """Stream an HTTP response directly to disk instead of buffering the whole file."""
+    os.makedirs(os.path.dirname(path) or DOWNLOAD_DIR, exist_ok=True)
+    temp_path = f"{path}.part"
+    total = 0
+    last_logged_mb = -1
+
+    try:
+        with open(temp_path, "wb") as f:
+            while True:
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                total += len(chunk)
+
+                current_mb = total // (1024 * 1024)
+                if current_mb > last_logged_mb:
+                    last_logged_mb = current_mb
+                    content_length = response.headers.get("Content-Length")
+                    if content_length:
+                        try:
+                            expected = int(content_length)
+                            pct = (total / expected) * 100 if expected else 0
+                            logger.info(
+                                f"📊 [{label}] Progress: {total / 1024 / 1024:.1f}/"
+                                f"{expected / 1024 / 1024:.1f} MB ({pct:.1f}%)"
+                            )
+                        except (TypeError, ValueError):
+                            logger.info(
+                                f"📊 [{label}] Downloaded: {total / 1024 / 1024:.1f} MB"
+                            )
+                    else:
+                        logger.info(
+                            f"📊 [{label}] Downloaded: {total / 1024 / 1024:.1f} MB"
+                        )
+
+        if total <= 0:
+            raise RuntimeError("API returned an empty audio file")
+
+        os.replace(temp_path, path)
+        return total
+    except Exception:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+
+
 def download_audio_shruti(
     video_id: str
 ) -> Optional[Dict[str, Any]]:
-    """Try ShrutiBots first and save its returned audio into DOWNLOAD_DIR.
+    """Download audio through ShrutiBots with low-memory streaming.
 
-    Supports either a direct audio response or JSON containing a downloadable URL.
-    Returns the same metadata shape used by the existing downloader, or None on failure.
+    The API may return either the audio bytes directly or JSON containing a
+    remote audio URL. Direct audio is streamed immediately to disk. Remote
+    audio is also streamed in chunks, avoiding response.read() buffering.
     """
     if not SHRUTI_API_KEY:
         logger.warning("ShrutiBots API key is not configured; using yt-dlp fallback.")
@@ -885,6 +937,23 @@ def download_audio_shruti(
         "api_key": SHRUTI_API_KEY,
     }
 
+    def build_data(filename: str, path: str, uploader: str = "ShrutiBots"):
+        size = os.path.getsize(path)
+        data = {
+            "status": True,
+            "title": video_id,
+            "duration": 0,
+            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            "filename": filename,
+            "path": path,
+            "download_url": f"/files/{filename}",
+            "videoId": video_id,
+            "uploader": uploader,
+            "filesize": size,
+        }
+        save_cached_metadata(data, "mp3")
+        return data
+
     try:
         logger.info(
             f"🚀 [PRIORITY 1] Trying ShrutiBots API for {video_id} (type: audio)"
@@ -893,44 +962,38 @@ def download_audio_shruti(
         query = urllib.parse.urlencode(params)
         request = urllib.request.Request(
             f"{api_url}?{query}",
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "audio/mpeg,audio/*,application/json;q=0.9,*/*;q=0.5",
+                "Accept-Encoding": "identity",
+                "Connection": "keep-alive",
+            },
         )
 
+        # Keep the resolver timeout separate from the actual transfer. Once the
+        # server starts returning bytes, urllib can continue reading normally.
         with urllib.request.urlopen(request, timeout=45) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
-            body = response.read()
 
-        # Direct audio/file response.
-        if body and (
-            content_type.startswith("audio/")
-            or "application/octet-stream" in content_type
-        ):
-            ext = "mp3" if "mpeg" in content_type or "mp3" in content_type else "audio"
-            filename = f"{video_id}.{ext}"
-            path = os.path.join(DOWNLOAD_DIR, filename)
-            with open(path, "wb") as f:
-                f.write(body)
-            if os.path.getsize(path) > 0:
+            # Direct audio response: stream immediately instead of response.read().
+            if content_type.startswith("audio/") or "application/octet-stream" in content_type:
+                ext = "mp3" if ("mpeg" in content_type or "mp3" in content_type) else "audio"
+                filename = f"{video_id}.{ext}"
+                path = os.path.join(DOWNLOAD_DIR, filename)
+
+                logger.info(f"📥 [SHRUTI] Streaming audio for {video_id}...")
+                size = _stream_http_to_file(response, path, video_id, "SHRUTI")
+
                 logger.info(
                     f"✅ [SHRUTI SUCCESS] Downloaded: {path} "
-                    f"({os.path.getsize(path) / 1024 / 1024:.2f} MB)"
+                    f"({size / 1024 / 1024:.2f} MB)"
                 )
-                data = {
-                    "status": True,
-                    "title": video_id,
-                    "duration": 0,
-                    "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-                    "filename": filename,
-                    "path": path,
-                    "download_url": f"/files/{filename}",
-                    "videoId": video_id,
-                    "uploader": "ShrutiBots",
-                    "filesize": os.path.getsize(path),
-                }
-                save_cached_metadata(data, "mp3")
-                return data
+                return build_data(filename, path)
 
-        # JSON response containing a remote audio URL.
+            # JSON responses are normally small, so buffering only this resolver
+            # response is fine. The actual MP3 is streamed below.
+            body = response.read()
+
         payload = json.loads(body.decode("utf-8", errors="replace"))
 
         def find_url(obj):
@@ -963,41 +1026,22 @@ def download_audio_shruti(
         logger.info(f"📥 [SHRUTI] Downloading audio for {video_id}...")
         audio_request = urllib.request.Request(
             remote_url,
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "audio/mpeg,audio/*,*/*;q=0.8",
+                "Accept-Encoding": "identity",
+                "Connection": "keep-alive",
+            },
         )
-        with urllib.request.urlopen(audio_request, timeout=90) as response:
-            audio_body = response.read()
-
-        if not audio_body:
-            raise RuntimeError("ShrutiBots returned an empty audio file")
 
         filename = f"{video_id}.mp3"
         path = os.path.join(DOWNLOAD_DIR, filename)
-        with open(path, "wb") as f:
-            f.write(audio_body)
+        with urllib.request.urlopen(audio_request, timeout=90) as response:
+            size = _stream_http_to_file(response, path, video_id, "SHRUTI")
 
-        if os.path.getsize(path) <= 0:
-            raise RuntimeError("Saved ShrutiBots audio file is empty")
-
-        logger.info(
-            f"📦 [SHRUTI] File size: {os.path.getsize(path) / 1024 / 1024:.2f} MB"
-        )
+        logger.info(f"📦 [SHRUTI] File size: {size / 1024 / 1024:.2f} MB")
         logger.info(f"✅ [SHRUTI SUCCESS] Downloaded: {path}")
-
-        data = {
-            "status": True,
-            "title": video_id,
-            "duration": 0,
-            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-            "filename": filename,
-            "path": path,
-            "download_url": f"/files/{filename}",
-            "videoId": video_id,
-            "uploader": "ShrutiBots",
-            "filesize": os.path.getsize(path),
-        }
-        save_cached_metadata(data, "mp3")
-        return data
+        return build_data(filename, path)
 
     except Exception as e:
         logger.warning(f"⚠️ [SHRUTI FAILED] {video_id}: {e}")
