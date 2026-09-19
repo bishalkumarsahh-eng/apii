@@ -91,3 +91,19 @@ Distributed under the MIT License.
 ## API Authentication
 
 Protected API endpoints require the `X-API-Key` header. Configure `API_KEY` in your hosting environment. `/` and `/health` remain public.
+
+## Docker deployment
+
+This project no longer uses an external tunnel. Run the FastAPI service directly with Docker.
+
+```bash
+docker build -t magma-music-api .
+docker run -d --name magma-music-api \
+  -p 8000:8000 \
+  --env-file .env \
+  magma-music-api
+```
+
+For a server/platform that provides its own `PORT`, the container already honors the `PORT` environment variable.
+
+Required secrets/configuration should be supplied as environment variables at runtime; do not bake `.env` into the image.

@@ -1,0 +1,16 @@
+.git
+.github
+__pycache__
+*.py[cod]
+*.log
+*.pid
+.cache
+.pytest_cache
+.venv
+venv
+env
+.env
+.DS_Store
+node_modules
+Dockerfile
+README_HEROKU.md
