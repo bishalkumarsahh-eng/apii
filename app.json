@@ -22,7 +22,7 @@
       "value": "downloads"
     },
     "CACHE_EXPIRE_HOURS": {
-      "value": "24"
+      "value": "0"
     },
     "MAX_VIDEO_QUALITY": {
       "value": "720"

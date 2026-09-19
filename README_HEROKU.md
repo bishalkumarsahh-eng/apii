@@ -20,7 +20,7 @@ The `Aptfile` installs FFmpeg. `package.json` provides Node.js for yt-dlp's EJS 
 ```text
 COOKIE_URL=https://raw.githubusercontent.com/themagmalord333-oss/COOKIE/main/cookies.txt
 DOWNLOAD_DIR=downloads
-CACHE_EXPIRE_HOURS=24
+CACHE_EXPIRE_HOURS=0
 MAX_VIDEO_QUALITY=720
 DOWNLOAD_WORKERS=4
 CONCURRENT_FRAGMENT_DOWNLOADS=15

@@ -39,7 +39,7 @@ DOWNLOAD_DIR = os.getenv(
 CACHE_EXPIRE_HOURS = float(
     os.getenv(
         "CACHE_EXPIRE_HOURS",
-        "24"
+        "0"
     )
 )
 
@@ -379,6 +379,13 @@ async def cache_cleanup_task():
             logger.info(
                 "Running advanced cache cleanup..."
             )
+
+            # CACHE_EXPIRE_HOURS <= 0 means permanent cache.
+            # Never scan/delete cached media in permanent-cache mode.
+            if CACHE_EXPIRE_HOURS <= 0:
+                logger.info("Permanent cache enabled — skipping automatic file deletion.")
+                await asyncio.sleep(3600)
+                continue
 
             expiry_time = (
                 time.time()
